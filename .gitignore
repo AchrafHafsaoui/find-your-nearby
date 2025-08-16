@@ -1,0 +1,24 @@
+# Gradle / builds
+.gradle/
+build/
+*/build/
+!gradle/wrapper/gradle-wrapper.jar
+
+# Android Studio
+.idea/
+*.iml
+.local/
+captures/
+
+# OS cruft
+.DS_Store
+Thumbs.db
+
+# Local config / secrets
+local.properties
+*.jks
+*.keystore
+*.keystore.properties
+
+# Logs
+*.log
