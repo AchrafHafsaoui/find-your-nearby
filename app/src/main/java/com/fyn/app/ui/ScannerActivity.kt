@@ -9,134 +9,34 @@ import android.bluetooth.le.*
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.net.Uri
 import android.os.*
 import android.os.ParcelUuid
 import android.view.Gravity
-import android.view.LayoutInflater
 import android.view.View
-import android.view.ViewGroup
-import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.TextView
 import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
-import androidx.recyclerview.widget.DiffUtil
-import androidx.recyclerview.widget.ListAdapter
-import androidx.recyclerview.widget.RecyclerView
 import com.fyn.app.R
 import com.fyn.app.ble.GattClient
 import com.fyn.app.ble.NearbyForegroundService
 import com.fyn.app.core.Constants
 import com.fyn.app.core.ProfileCard
 import com.fyn.app.databinding.ActivityScannerBinding
-import com.fyn.app.databinding.ItemPeerBinding
-
-// ---- List models ----
+import com.google.android.material.bottomsheet.BottomSheetDialog
+import android.widget.ImageView
+import android.util.TypedValue
 
 data class Peer(
     val device: BluetoothDevice,
     val rssi: Int,
     val serviceData: ByteArray?,
-    val aliases: Map<String, String>? = null // fetched socials (key -> username/handle)
+    val angleRad: Float,                  // stable position on the radar
+    val aliases: Map<String, String>? = null
 )
-
-class PeerDiff : DiffUtil.ItemCallback<Peer>() {
-    override fun areItemsTheSame(oldItem: Peer, newItem: Peer) =
-        oldItem.device.address == newItem.device.address
-    override fun areContentsTheSame(oldItem: Peer, newItem: Peer) = oldItem == newItem
-}
-
-class PeerAdapter(private val onTap: (Peer) -> Unit) :
-    ListAdapter<Peer, PeerVH>(PeerDiff()) {
-    override fun onCreateViewHolder(parent: ViewGroup, viewType: Int) =
-        PeerVH(ItemPeerBinding.inflate(LayoutInflater.from(parent.context), parent, false), onTap)
-    override fun onBindViewHolder(holder: PeerVH, position: Int) =
-        holder.bind(getItem(position))
-}
-
-class PeerVH(private val vb: ItemPeerBinding, private val onTap: (Peer) -> Unit) :
-    RecyclerView.ViewHolder(vb.root) {
-
-    fun bind(p: Peer) {
-        vb.title.text = "Tap to view profile"
-        vb.subtitle.text = "Signal: ${p.rssi}"
-
-        // Render aliases (icon + username)
-        val aliases = p.aliases.orEmpty().filterValues { !it.isNullOrBlank() }
-        vb.aliasesContainer.removeAllViews()
-        if (aliases.isNotEmpty()) {
-            vb.aliasesContainer.visibility = View.VISIBLE
-            val order = listOf("facebook", "instagram", "snapchat", "linkedin", "x", "tiktok")
-            for (key in order) {
-                val value = aliases[key] ?: continue
-                addAliasRow(vb.aliasesContainer, iconFor(key), value)
-            }
-            // Render any extra, unknown keys at the end
-            for ((k, v) in aliases) {
-                if (k !in order) addAliasRow(vb.aliasesContainer, 0, "$k: $v")
-            }
-        } else {
-            vb.aliasesContainer.visibility = View.GONE
-        }
-
-        vb.root.setOnClickListener { onTap(p) }
-    }
-
-    // Before
-// private fun addAliasRow(container: LinearLayout, iconRes: Int, text: String)
-
-    // After
-    private fun addAliasRow(container: LinearLayout, iconRes: Int, label: String) {
-        val ctx = container.context
-        val row = LinearLayout(ctx).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-            setPadding(0, 4.dp(), 0, 4.dp())
-            layoutParams = LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT
-            )
-        }
-
-        if (iconRes != 0) {
-            val iv = ImageView(ctx).apply {
-                layoutParams = LinearLayout.LayoutParams(18.dp(), 18.dp()).also {
-                    it.marginEnd = 8.dp()
-                }
-                setImageResource(iconRes)
-                scaleType = ImageView.ScaleType.CENTER_INSIDE
-            }
-            row.addView(iv)
-        }
-
-        val tv = TextView(ctx).apply {
-            textSize = 14f
-            textAlignment = View.TEXT_ALIGNMENT_VIEW_START
-            text = label            // <-- use the renamed param
-        }
-        row.addView(tv)
-
-        container.addView(row)
-    }
-
-
-    private fun iconFor(key: String): Int = when (key.lowercase()) {
-        "facebook" -> R.drawable.ic_facebook
-        "instagram" -> R.drawable.ic_instagram
-        "snapchat" -> R.drawable.ic_snapchat
-        "linkedin" -> R.drawable.ic_linkedin
-        "x" -> R.drawable.ic_x
-        "tiktok" -> R.drawable.ic_tiktok
-        else -> 0
-    }
-
-    private fun Int.dp(): Int =
-        (this * vb.root.resources.displayMetrics.density).toInt()
-}
-
-// ---- Activity ----
 
 class ScannerActivity : AppCompatActivity() {
 
@@ -147,8 +47,6 @@ class ScannerActivity : AppCompatActivity() {
     private val scanner by lazy { adapter.bluetoothLeScanner }
 
     private val peers = mutableMapOf<String, Peer>()
-    private val peerAdapter = PeerAdapter { onPeerTap(it) }
-
     private var isScanning = false
 
     private val runtimePerms = arrayOf(
@@ -172,13 +70,15 @@ class ScannerActivity : AppCompatActivity() {
             runOnUiThread {
                 val key = dev.address
                 val prev = peers[key]
+                val angle = prev?.angleRad ?: angleForAddress(key)
                 peers[key] = Peer(
                     device = dev,
                     rssi = rssi,
                     serviceData = data,
-                    aliases = prev?.aliases // keep any fetched aliases
+                    angleRad = angle,
+                    aliases = prev?.aliases
                 )
-                renderPeers()
+                renderRadar()
                 binding.txtScanState.text = "Scanning: ON • ${peers.size} found"
             }
         }
@@ -193,11 +93,16 @@ class ScannerActivity : AppCompatActivity() {
         super.onCreate(savedInstanceState)
         binding = ActivityScannerBinding.inflate(layoutInflater)
         setContentView(binding.root)
-
         setSupportActionBar(binding.toolbar)
 
-        binding.recycler.adapter = peerAdapter
-        binding.recycler.layoutManager = androidx.recyclerview.widget.LinearLayoutManager(this)
+        binding.radar.onDotClick = dot@ { address ->
+            val p = peers[address] ?: return@dot
+            if (!p.aliases.isNullOrEmpty()) {
+                showPeerSheet(p)
+            } else {
+                fetchAliasesThenShow(p)
+            }
+        }
 
         binding.btnStartScan.setOnClickListener { startScan() }
         binding.btnStopScan.setOnClickListener { stopScan() }
@@ -218,7 +123,7 @@ class ScannerActivity : AppCompatActivity() {
             return
         }
         peers.clear()
-        renderPeers()
+        renderRadar()
 
         val filter = ScanFilter.Builder()
             .setServiceUuid(ParcelUuid(Constants.SERVICE_UUID))
@@ -244,9 +149,18 @@ class ScannerActivity : AppCompatActivity() {
         updateUi()
     }
 
-    private fun renderPeers() {
-        val list = peers.values.sortedByDescending { it.rssi }
-        peerAdapter.submitList(list.toList())
+    private fun renderRadar() {
+        val list = peers.values.toList()
+        binding.radar.setPeers(
+            list.map {
+                RadarPeer(
+                    address = it.device.address,
+                    rssi = it.rssi,
+                    angleRad = it.angleRad,
+                    hasAliases = !it.aliases.isNullOrEmpty()
+                )
+            }
+        )
         binding.empty.visibility = if (list.isEmpty()) View.VISIBLE else View.GONE
     }
 
@@ -268,20 +182,125 @@ class ScannerActivity : AppCompatActivity() {
     private fun hasAllPerms(): Boolean =
         runtimePerms.all { ContextCompat.checkSelfPermission(this, it) == PackageManager.PERMISSION_GRANTED }
 
-    private fun onPeerTap(peer: Peer) {
+    private fun fetchAliasesThenShow(peer: Peer) {
         val client = GattClient(this) { card: ProfileCard ->
-            // keep only supported keys, retain order when rendering
-            val supported = card.aliases
-                .filterKeys { it.lowercase() in setOf("facebook","instagram","snapchat","linkedin","x","tiktok") }
-
+            val supported = card.aliases.filterKeys {
+                it.lowercase() in setOf("facebook","instagram","snapchat","linkedin","x","tiktok")
+            }
             peers[peer.device.address]?.let { old ->
-                peers[peer.device.address] = old.copy(aliases = supported)
-                runOnUiThread { renderPeers() }
+                val updated = old.copy(aliases = supported)
+                peers[peer.device.address] = updated
+                runOnUiThread {
+                    renderRadar()
+                    showPeerSheet(updated)
+                }
             }
         }
         stopScan() // reduce scan/connection interference
         client.connectAndFetch(peer.device)
     }
+
+    // —— Peer bottom sheet with clickable aliases ——
+    private fun showPeerSheet(p: Peer) {
+        val dialog = BottomSheetDialog(this)
+        val ctx = this
+
+        val container = LinearLayout(ctx).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(16), dp(16), dp(16), dp(16))
+        }
+
+        val title = TextView(ctx).apply {
+            text = "Nearby person"
+            textSize = 18f
+            setPadding(0, 0, 0, dp(8))
+        }
+        container.addView(title)
+
+        val aliases = p.aliases.orEmpty()
+        if (aliases.isEmpty()) {
+            val tv = TextView(ctx).apply { text = "No aliases shared." }
+            container.addView(tv)
+        } else {
+            val order = listOf("facebook", "instagram", "snapchat", "linkedin", "x", "tiktok")
+            for (key in order) {
+                aliases[key]?.let { addAliasRow(container, key, it) }
+            }
+            // extras
+            for ((k,v) in aliases) if (k !in order) addAliasRow(container, k, "$k: $v", clickable = false)
+        }
+
+        dialog.setContentView(container)
+        dialog.show()
+    }
+
+    private fun addAliasRow(parent: LinearLayout, platform: String, handle: String, clickable: Boolean = true) {
+        val ctx = parent.context
+        val row = LinearLayout(ctx).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(0, dp(8), 0, dp(8))
+        }
+        val iv = ImageView(ctx).apply {
+            setImageResource(iconFor(platform))
+            layoutParams = LinearLayout.LayoutParams(dp(20), dp(20)).also { it.marginEnd = dp(10) }
+        }
+        val tv = TextView(ctx).apply {
+            text = handle
+            textSize = 16f
+        }
+        row.addView(iv)
+        row.addView(tv)
+
+        if (clickable) {
+            val tvAttr = TypedValue()
+            ctx.theme.resolveAttribute(android.R.attr.selectableItemBackground, tvAttr, true)
+            row.setBackgroundResource(tvAttr.resourceId)
+            row.isClickable = true; row.isFocusable = true
+
+            val url = buildProfileUrl(platform, handle)
+            row.setOnClickListener {
+                try { startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url))) }
+                catch (_: Exception) { Toast.makeText(ctx, "Can't open link", Toast.LENGTH_SHORT).show() }
+            }
+        }
+
+        parent.addView(row)
+    }
+
+    private fun iconFor(key: String): Int = when (key.lowercase()) {
+        "facebook" -> R.drawable.ic_facebook
+        "instagram" -> R.drawable.ic_instagram
+        "snapchat" -> R.drawable.ic_snapchat
+        "linkedin" -> R.drawable.ic_linkedin
+        "x" -> R.drawable.ic_x
+        "tiktok" -> R.drawable.ic_tiktok
+        else -> android.R.drawable.ic_menu_info_details
+    }
+
+    private fun buildProfileUrl(platform: String, aliasRaw: String): String {
+        val v = aliasRaw.trim()
+        if (v.startsWith("http://", true) || v.startsWith("https://", true)) return v
+        val h = v.removePrefix("@").trim()
+        return when (platform.lowercase()) {
+            "facebook" -> "https://facebook.com/$h"
+            "instagram" -> "https://instagram.com/$h"
+            "snapchat" -> "https://www.snapchat.com/add/$h"
+            "linkedin" -> if (h.contains("/")) "https://www.linkedin.com/$h" else "https://www.linkedin.com/in/$h"
+            "x" -> "https://x.com/$h"
+            "tiktok" -> "https://www.tiktok.com/@${h.removePrefix("@")}"
+            else -> "https://www.google.com/search?q=$h"
+        }
+    }
+
+    private fun angleForAddress(address: String): Float {
+        // stable pseudo-random angle per device
+        val h = address.hashCode()
+        val deg = ((h and 0x7fffffff) % 360)
+        return (deg.toFloat() / 180f * Math.PI).toFloat()
+    }
+
+    private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
 
     private fun <T> isServiceRunning(service: Class<T>): Boolean {
         val am = getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
